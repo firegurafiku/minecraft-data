@@ -10,6 +10,7 @@ import Data.Serialize
 import qualified Data.Serialize.Builder as Builder
 import Data.Vector (Vector)
 import qualified Data.Vector as V
+import Data.Maybe
 import Data.Word
 import System.FilePath
 
@@ -89,7 +90,25 @@ getRawRegion = do
 instance Serialize Region where
   get = do raw <- getRawRegion
            return $ Region (getChunks raw)
-  put = undefined
+  put (Region vector)
+      = do let getBs (Chunk bs) = bs
+               pad4k s = let (q, r) = quotRem s 4096 in if r == 0 then q else q + 1
+               comps   = map (fmap $ compress . getBs) (V.toList vector)
+               lengths = map (maybe 0 L.length) comps
+               lenSec  = map (pad4k . (+5)) lengths
+               starts  = scanl (+) 2 lenSec
+               locations = zipWith (\a b -> if b == 0 then Loc 0 0 else Loc (fromIntegral a) (fromIntegral b)) starts lenSec
+
+           mapM_ put locations
+           replicateM_ 1024 (putWord32be 0)
+           forM_ (zip3 comps lengths lenSec) $ \(c,len,sec) -> do
+               when (isJust c) $ do
+                   let Just d = c
+                   putWord32be $ fromIntegral (len+1)
+                   putWord8 2
+                   put d
+                   replicateM_ (fromIntegral (4096*sec - len - 5)) (putWord8 0)
+
 
 -- | Given 'ChunkCoords', gives back the 'RegionCoords' containing
 -- that chunk
