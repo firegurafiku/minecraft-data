@@ -1,4 +1,14 @@
-module Game.Minecraft.Region where
+module Game.Minecraft.Region (
+        ChunkCoords,
+        RegionCoords,
+        Region(..),
+        Chunk(..),
+        Location(..),
+        chunkToRegionCoords,
+        regionFileName,
+        loadRegion,
+        saveRegion)
+where
 
 import Codec.Compression.Zlib
 import Control.Applicative
@@ -14,7 +24,7 @@ import Data.Maybe
 import Data.Word
 import System.FilePath
 
-import Data.NBT
+import qualified Data.NBT as NBT
 import Game.Minecraft.Block
 
 -- | The (X,Z) coordinates specifying a 'Chunk'
@@ -24,11 +34,10 @@ type ChunkCoords = (Int, Int)
 type RegionCoords = (Int, Int)
 
 -- | A region contains a collection of 'Chunk's
--- TODO: Replace bytestring with actual chunk data
 data Region = Region (Vector (Maybe Chunk))
             deriving Show
 
-data Chunk = Chunk L.ByteString
+data Chunk = Chunk NBT.NBT
 
 instance Show Chunk where 
   show _ = "<chunk>"
@@ -56,6 +65,7 @@ instance Serialize Location where
   put (Loc offset sectorCount) = 
     putWord24be (fromIntegral offset) >> put sectorCount
 
+pad4k s = let (q, r) = quotRem s 4096 in if r == 0 then q else q + 1
 getLocations :: Get (Vector Location)
 getLocations = V.replicateM 1024 (get :: Get Location)
 
@@ -66,11 +76,14 @@ getTimestamps = replicateM_ 1024 (get :: Get Word32)
 getChunks :: (Vector Location, L.ByteString) -> Vector (Maybe Chunk)
 getChunks (locV, chunkData) = V.map getChunk locV
   where
-    getChunk (Loc 0 0)                = mzero
-    getChunk (Loc offset sectorCount) = 
-      return . Chunk . either error id . runGetLazy extractChunk $
-             L.take (4096 * (fromIntegral sectorCount))
-                    (L.drop (4096 * (fromIntegral (offset - 2))) chunkData)
+    getChunk :: Location -> Maybe Chunk
+    getChunk (Loc 0 0)                = Nothing
+    getChunk (Loc offset sectorCount) = Just $ Chunk (either error id $ either error decodeLazy bs)
+        where bs :: Either String L.ByteString
+              bs = runGetLazy extractChunk $
+                   L.take (4096 * (fromIntegral sectorCount))
+                      (L.drop (4096 * (fromIntegral (offset - 2))) chunkData)
+
     extractChunk = do 
       len <- fromIntegral <$> getWord32be
       compScheme <- getWord8
@@ -78,7 +91,9 @@ getChunks (locV, chunkData) = V.map getChunk locV
         1 -> fail "GZip-compressed chunks not supported"
         2 -> decompress . L.fromChunks . (:[]) <$> ensure (len-1)
 
-
+encodeChunk :: Chunk -> L.ByteString
+encodeChunk chunk = encodeLazy chunkNbt
+    where Chunk chunkNbt = chunk
 
 getRawRegion :: Get (Vector Location, L.ByteString)
 getRawRegion = do
@@ -90,25 +105,36 @@ getRawRegion = do
 instance Serialize Region where
   get = do raw <- getRawRegion
            return $ Region (getChunks raw)
-  put (Region vector)
-      = do let getBs (Chunk bs) = bs
-               pad4k s = let (q, r) = quotRem s 4096 in if r == 0 then q else q + 1
-               comps   = map (fmap $ compress . getBs) (V.toList vector)
-               lengths = map (maybe 0 L.length) comps
-               lenSec  = map (pad4k . (+5)) lengths
-               starts  = scanl (+) 2 lenSec
-               locations = zipWith (\a b -> if b == 0 then Loc 0 0 else Loc (fromIntegral a) (fromIntegral b)) starts lenSec
 
+  put region = do
            mapM_ put locations
+           -- Don't care about timestamps yet.
            replicateM_ 1024 (putWord32be 0)
-           forM_ (zip3 comps lengths lenSec) $ \(c,len,sec) -> do
-               when (isJust c) $ do
-                   let Just d = c
-                   putWord32be $ fromIntegral (len+1)
-                   putWord8 2
-                   put d
-                   replicateM_ (fromIntegral (4096*sec - len - 5)) (putWord8 0)
 
+           forM_ (zip3 compressedChunks chunkLengths chunkLengthsInSec)
+             $ \(mbChunk, len, sec) -> do
+               when (isJust mbChunk) $ do
+                   let Just chunk = mbChunk
+                       paddingSize = fromIntegral (4096*sec - len - 5)
+
+                   putWord32be $ fromIntegral (len+1)
+                   putWord8 2 -- compression method
+                   put $ encode chunk
+                   replicateM_ paddingSize (putWord8 0)
+
+         where
+           getBs (Chunk bs) = bs
+           Region vector = region
+           compressedChunks  = map (fmap $ compress . encodeChunk) (V.toList vector)
+           chunkLengths      = map (maybe 0 $ fromIntegral . L.length) compressedChunks
+           chunkLengthsInSec = map (pad4k . (+5)) chunkLengths
+           chunkOffsetsInSec = scanl (+) 2 chunkLengthsInSec
+           locations         = zipWith getLocation chunkOffsetsInSec chunkLengths
+
+           getLocation :: Int -> Int -> Location
+           getLocation offset size = if size == 0
+                                     then Loc 0 0
+                                     else Loc (fromIntegral offset) (fromIntegral size)
 
 -- | Given 'ChunkCoords', gives back the 'RegionCoords' containing
 -- that chunk
@@ -120,16 +146,8 @@ chunkToRegionCoords (x, z) = (x `shift` (-5), z `shift` (-5))
 regionFileName :: RegionCoords -> FilePath
 regionFileName (x, z) = "r" <.> show x <.> show z <.> "mcr"
 
-testRegion = decode <$> S.readFile ("testWorld/region" </> regionFileName (-1,-1)) :: IO (Either String Region)
+loadRegion :: FilePath -> IO (Either String Region)
+loadRegion filename = decode <$> S.readFile filename
 
-testChunk = do (Right (Region v)) <- testRegion
-               let (Just (Chunk c)) = (V.!) v 1023
-                   (Right nbt) = decodeLazy c
-               return (nbt :: NBT)
-
-testBlocks = do (CompoundTag _ [(CompoundTag (Just "Level") ts)]) <- testChunk
-                return $ filter (\t -> case t of (ByteArrayTag (Just "Blocks") _ _) -> True; _ -> False) ts
-
-testBlockIds :: IO [BlockId]
-testBlockIds = do [(ByteArrayTag _ _ bs)] <- testBlocks
-                  return (map (toEnum . fromIntegral) (S.unpack bs))
+saveRegion :: FilePath -> Region -> IO ()
+saveRegion filename region = S.writeFile filename (encode region)
